@@ -58,7 +58,7 @@ abstract class DocumentProcessor
     {
         if (!isStopword(word))
         {
-            writer.write(word, documentId, offset);
+            writer.insert(word, documentId, offset);
         }
     }
 

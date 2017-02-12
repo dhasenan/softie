@@ -1,12 +1,16 @@
 module multifile;
 
-import std.file : exists;
-import std.string : toStringz;
 import std.container.rbtree;
+import std.file : exists;
+import std.format;
+import std.string : toStringz, fromStringz;
 
-//import core.stdc.stdio;
-import core.sys.posix.sys.mman;
+import std.experimental.logger;
+
+import core.stdc.errno;
+import core.stdc.string;
 import core.sys.posix.stdio;
+import core.sys.posix.sys.mman;
 import core.sys.posix.unistd;
 
 /**
@@ -15,7 +19,8 @@ import core.sys.posix.unistd;
   Each data chunk can grow. Growing a data chunk may cause it to be reallocated.
 
   Multifile is designed to handle small numbers of chunks (around 100k). It reads its index into
-  memory, which may not be appropriate for some use cases.
+  memory, which may not be appropriate for some use cases. The remainder of the file is only read as
+  necessary.
 
   A Multifile does not give you extra padding so that your files can grow in place. If you want
   padding, please manage that on your own. In essence, Multifile is optimized more for compactness
@@ -30,17 +35,23 @@ struct Multifile
 
     /**
       Open a Multifile, creating it if necessary.
-      */
+
+      Params:
+        file = The path to the file.
+        createIfNecessary = Whether to create the file if necessary. Does not create directories.
+    */
     this(string file, bool createIfNecessary)
     {
         if (!exists(file))
         {
             if (createIfNecessary)
             {
+                infof("creating file %s", file);
                 fd = fopen(file.toStringz, "a+");
                 fd.write(MAGIC);
                 fd.writeUlong(DATA_START);
                 fd.writeUlong(0);
+                fd.fflush();
             }
             else
             {
@@ -49,10 +60,12 @@ struct Multifile
         }
         else
         {
+            infof("using existing file %s", file);
             fd = fopen(file.toStringz, "a+");
         }
         filenumber = fileno(fd);
-        fseek(fd, 0, SEEK_SET);
+        infof("filenumber: %s", filenumber);
+        seek(fd, 0);
         // verify MAGIC
         ubyte[4] m;
         fd.read(m[]);
@@ -63,12 +76,17 @@ struct Multifile
                     file ~ ". Is this a softie multifile?");
         }
 
+        infof("verified magic");
+
         // find where the index is
         auto indexPos = fd.readUlong;
-        auto indexFd = fopen(file.toStringz, "w+");
-        fseek(indexFd, indexPos, SEEK_SET);
+        infof("index starts at %s", indexPos);
+        auto indexFd = fopen(file.toStringz, "a+");
+        seek(indexFd, indexPos);
         index = Index(indexFd);
         index.read();
+
+        infof("read index");
     }
 
     /**
@@ -76,10 +94,25 @@ struct Multifile
 
         Require that it be at least minLength bytes long. If it is shorter, it will be extended in
         place or reallocated.
+
+        This will create it if it doesn't already exist. In this case, its contents are undefined.
+
+        The buffer is memory mapped in.
+
+        If the index must be rewritten (it's a new entry or we had to move the subfile), then this
+        will write the index to the file. Otherwise, this does not cause any writes.
+
+        The length of the underlying segment must be an integer number of pages.
       */
     void manipulate(string name, ulong minLength, void delegate(scope ubyte[]) dg)
     {
+        checkNotClosed;
         auto entry = fetchWithLength(name, minLength);
+        if (entry.length == 0)
+        {
+            throw new Exception("failed to reallocate entry");
+        }
+        infof("mmap: %s bytes at %s", entry.length, entry.start);
         auto ptr = mmap(
                 null,
                 entry.length,
@@ -87,22 +120,92 @@ struct Multifile
                 MAP_SHARED,
                 filenumber,
                 entry.start);
+        if (ptr == cast(void*)-1)
+        {
+            auto err = strerror(errno);
+            throw new Exception("failed to mmap file: " ~ err.fromStringz.idup);
+        }
         scope(exit)munmap(ptr, entry.length);
         auto data = (cast(ubyte*)ptr)[0..entry.length];
         dg(data);
     }
 
-    void write(string name, ulong offset, ubyte[] data)
+    /**
+        Read the specified slice of the given entry.
+
+        This will return as much data as available, up to count bytes. If less is available, you
+        will get a smaller result than you asked for.
+      */
+    ubyte[] read(string name, ulong offset, ulong count)
     {
+        auto entry = index.get(name);
+        if (!entry.exists) return null;
+        auto avail = entry.length - offset;
+        if (avail > count) avail = count;
+        auto buf = new ubyte[entry.length - offset];
+        seek(fd, entry.start + offset);
+        fd.read(buf);
+        return buf;
+    }
+
+    /**
+        Read the entirety of the given entry.
+      */
+    ubyte[] read(string name)
+    {
+        auto entry = index.get(name);
+        if (!entry.exists) return null;
+        auto buf = new ubyte[entry.length];
+        seek(fd, entry.start);
+        infof("reading %s bytes from entry %s at offset %s", buf.length, name, entry.start);
+        fd.read(buf);
+        return buf;
+    }
+
+    /**
+        Write data directly to the given entry.
+      */
+    void write(string name, ulong offset, scope const ubyte[] data)
+    {
+        checkNotClosed;
         auto entry = fetchWithLength(name, offset + data.length);
-        fseek(fd, entry.start + offset, SEEK_SET);
+        auto start = entry.start + offset;
+        infof("writing %s bytes to entry %s at offset %s", data.length, name, start);
+        seek(fd, entry.start + offset);
         fd.write(data);
+        fd.fflush();
+        infof("wrote %s data bytes to file", data.length);
+    }
+
+    /**
+        Flush data to the file.
+      */
+    void flush()
+    {
+        checkNotClosed;
+        index.write();
+        fflush(fd);
+    }
+
+    void close()
+    {
+        flush();
+        fclose(fd);
+        fd = null;
     }
 
 private:
     int filenumber;
     FILE* fd;
     Index index;
+
+    void checkNotClosed()
+    {
+        if (fd is null)
+        {
+            throw new Exception("tried to perform an operation on a closed Multifile");
+        }
+    }
 
     /*
        Fetch an entry with the given name
@@ -112,29 +215,36 @@ private:
         auto entry = index.get(name);
         if (!entry.exists)
         {
-            return index.create(name, minLength);
+            entry = index.create(name, minLength);
+            index.write();
+            return entry;
         }
+        infof("entry %s exists already", name);
+        infof("length: %s vs %s", entry.length, minLength);
         if (entry.length >= minLength)
         {
             return entry;
         }
         if (index.resizeInPlace(entry, minLength))
         {
+            infof("resized in place");
             return entry;
         }
+        infof("manually moving and resizing");
         auto next = index.create("$$softie-tmp-resize", minLength);
         auto src = fdopen(dup(fileno(fd)), "a+");
         scope (exit) fclose(src);
-        fseek(src, entry.start, SEEK_SET);
-        fseek(fd, next.start, SEEK_SET);
+        seek(src, entry.start);
+        seek(fd, next.start);
         ubyte[1] buf;
-        for (ulong i = 0; i < minLength; i++)
+        for (ulong i = 0; i < entry.length; i++)
         {
             src.read(buf);
             fd.write(buf);
         }
         index.remove(entry);
         index.rename(next, name);
+        flush();
         return next;
     }
 }
@@ -179,18 +289,23 @@ struct Index
 
     FILE* fd;
 
-    RedBlackTree!(Entry, "a.start < b.start") byPosition;
-    RedBlackTree!(Entry, "a.name < b.name") byName;
+    alias RedBlackTree!(Entry, "a.start < b.start") ByPosition;
+    alias RedBlackTree!(Entry, "a.name < b.name") ByName;
+    ByPosition byPosition;
+    ByName byName;
 
     this(FILE* fd)
     {
         this.fd = fd;
+        byPosition = new ByPosition;
+        byName = new ByName;
     }
 
     /// Read an index from the file at its current location.
     void read()
     {
         auto len = fd.readUlong;
+        infof("index has %s entries", len);
         for (int i = 0; i < len; i++)
         {
             insert(Entry.read(fd));
@@ -212,12 +327,13 @@ struct Index
             if (!next.empty && next.front.start < e.start + size)
             {
                 // We need to find another location for the index.
+                // Remove it first so it doesn't mess us up later.
                 remove(e);
                 writeToNewSection();
             }
             else
             {
-                fseek(fd, r.front.start, SEEK_SET);
+                seek(fd, r.front.start);
                 writeHere();
             }
         }
@@ -270,6 +386,7 @@ struct Index
     Entry create(string name, ulong length)
     {
         auto e = Entry(name, findGap(length), length);
+        infof("created new entry %s", e);
         insert(e);
         return e;
     }
@@ -299,25 +416,37 @@ private:
         // We have to create the entry a bit manually because it's awkward to calculate the size
         // and position all in one go.
         auto entry = Entry(INDEX_NAME, 0, 0);
+
+        // We don't have the index entry at this point.
         auto reserved = size + entry.headerSize;
+
+        // Give us a margin so we don't have to grow quite as fast.
+        reserved += reserved >> 1;
         entry.length = reserved;
+
+        // Figure out where to put it...
         auto gap = findGap(reserved);
+
+        // And put it there.
         entry.start = gap;
         insert(entry);
-        fseek(fd, gap, SEEK_SET);
+        seek(fd, gap);
         writeHere();
     }
 
     void writeHere()
     {
         auto start = ftell(fd);
+        infof("writing index to position %s", start);
         fd.writeUlong(byName.length);
+        infof("we have %s entries", byName.length);
         foreach (entry; byName)
         {
             entry.write(fd);
         }
-        fseek(fd, INDEX_POINTER_POSITION, SEEK_SET);
+        seek(fd, INDEX_POINTER_POSITION);
         fd.writeUlong(cast(ulong)start);
+        infof("wrote index pointer %s", cast(ulong)start);
     }
 }
 
@@ -404,9 +533,12 @@ void writeUlong(FILE* fd, ulong v)
 
 void read(FILE* fd, scope ubyte[] buf)
 {
-    if (fread(buf.ptr, ubyte.sizeof, buf.length, fd) != buf.length)
+    auto count = fread(buf.ptr, ubyte.sizeof, buf.length, fd);
+    if (count != buf.length)
     {
-        throw new Exception("insufficient read");
+        auto c = ftell(fd);
+        throw new Exception("insufficient read: got %s, expected %s, at offset %s".format(
+            count, buf.length, c));
     }
 }
 
@@ -416,4 +548,48 @@ void write(FILE* fd, scope const ubyte[] buf)
     {
         throw new Exception("failed to write to file");
     }
+}
+
+void seek(FILE* fd, ulong pos)
+{
+    auto res = fseek(fd, pos, SEEK_SET);
+    if (res != 0)
+    {
+        auto err = errno;
+        auto errstr = strerror(err).fromStringz.idup;
+        throw new Exception("failed to seek to position %s in file: %s".format(pos, errstr));
+    }
+}
+
+
+unittest
+{
+    import std.file;
+
+    enum filename = "unittest.sfm";
+
+    try
+    {
+        remove(filename);
+    }
+    catch (Exception e)
+    {
+        // is okay
+    }
+
+    auto multi = Multifile(filename, true);
+
+    ubyte[] data = [1, 1, 2, 3, 5, 8, 13, 21, 34, 55];
+    multi.write("test-range-1", 0, data);
+    infof("wrote data");
+    auto read1 = multi.read("test-range-1");
+    assert(read1 == data, "wanted %s got %s".format(data, read1));
+    auto data2 = cast(const ubyte[])"A british tar is a soaring soul";
+    multi.write("test-range-2", 0, data2);
+    infof("wrote data2");
+    assert(multi.read("test-range-2") == data2);
+    multi.flush;
+    multi.close;
+
+    multi = Multifile(filename, true);
 }

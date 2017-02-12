@@ -29,40 +29,8 @@ class Index : WordWriter
     */
     this(
         string filename,
-        bool[string] stopWords = null,
-        ubyte wordSize = 14,
-        ulong numWordHint = 50_000,
-        ulong numDocumentsHint = 50_000)
+        bool[string] stopWords = null)
     {
-        import std.algorithm.comparison : max;
-
-        this.filename = filename;
-        this.stopWords = stopWords;
-        this.wordSize = max(wordSize, cast(ubyte)8);
-        this.numWordHint = max(numWordHint, 5_000);
-        this.numDocumentsHint = max(numDocumentsHint, 500);
-
-        auto wordStructLength = wordSize + 2*ulong.sizeof;
-        auto wordReservation = wordStructLength *  numWordHint;
-        // Extra space, just in case.
-        wordReservation += wordReservation >> 1;
-        // Figure out the start of the files section.
-        filesOffset = wordsOffset + wordReservation;
-        auto b = filesOffset & (PAGE_SIZE - 1);
-        if (b != 0)
-        {
-            filesOffset += PAGE_SIZE;
-            filesOffset -= b;
-        }
-
-        if (filename.exists)
-        {
-            this.open();
-        }
-        else
-        {
-            this.writeInitialData();
-        }
     }
 
     /**
@@ -80,6 +48,7 @@ class Index : WordWriter
     */
     docid documentId(string documentName)
     {
+        return docid.init;
     }
 
     /// Maximum length for a document name.
@@ -90,7 +59,6 @@ private:
 
     void open()
     {
-        db = Database(filename);
     }
 }
 
