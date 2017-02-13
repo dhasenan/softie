@@ -13,6 +13,8 @@ import core.sys.posix.stdio;
 import core.sys.posix.sys.mman;
 import core.sys.posix.unistd;
 
+version(unittest) version = multifilelog;
+
 /**
   A Multifile is a file containing multiple independently modifiable data chunks.
 
@@ -42,12 +44,14 @@ struct Multifile
     */
     this(string file, bool createIfNecessary)
     {
+        this.filename = file;
+        this.fileZ = file.toStringz;
         if (!exists(file))
         {
             if (createIfNecessary)
             {
-                infof("creating file %s", file);
-                fd = fopen(file.toStringz, "a+");
+                version(multifilelog) infof("creating file %s", file);
+                fd = fopen(fileZ, "w+");
                 fd.write(MAGIC);
                 fd.writeUlong(DATA_START);
                 fd.writeUlong(0);
@@ -60,11 +64,11 @@ struct Multifile
         }
         else
         {
-            infof("using existing file %s", file);
-            fd = fopen(file.toStringz, "a+");
+            version(multifilelog) infof("using existing file %s", file);
+            fd = fopen(fileZ, "r+");
         }
         filenumber = fileno(fd);
-        infof("filenumber: %s", filenumber);
+        version(multifilelog) infof("filenumber: %s", filenumber);
         seek(fd, 0);
         // verify MAGIC
         ubyte[4] m;
@@ -76,17 +80,19 @@ struct Multifile
                     file ~ ". Is this a softie multifile?");
         }
 
-        infof("verified magic");
+        version(multifilelog) infof("verified magic");
 
         // find where the index is
         auto indexPos = fd.readUlong;
-        infof("index starts at %s", indexPos);
-        auto indexFd = fopen(file.toStringz, "a+");
+        version(multifilelog) infof("index starts at %s", indexPos);
+
+        // open and read the index
+        auto indexFd = fopen(fileZ, "r+");
         seek(indexFd, indexPos);
         index = Index(indexFd);
         index.read();
 
-        infof("read index");
+        version(multifilelog) infof("read index");
     }
 
     /**
@@ -112,7 +118,7 @@ struct Multifile
         {
             throw new Exception("failed to reallocate entry");
         }
-        infof("mmap: %s bytes at %s", entry.length, entry.start);
+        version(multifilelog) infof("mmap: %s bytes at %s", entry.length, entry.start);
         auto ptr = mmap(
                 null,
                 entry.length,
@@ -157,7 +163,7 @@ struct Multifile
         if (!entry.exists) return null;
         auto buf = new ubyte[entry.length];
         seek(fd, entry.start);
-        infof("reading %s bytes from entry %s at offset %s", buf.length, name, entry.start);
+        version(multifilelog) infof("reading %s bytes from entry %s at offset %s", buf.length, name, entry.start);
         fd.read(buf);
         return buf;
     }
@@ -170,11 +176,11 @@ struct Multifile
         checkNotClosed;
         auto entry = fetchWithLength(name, offset + data.length);
         auto start = entry.start + offset;
-        infof("writing %s bytes to entry %s at offset %s", data.length, name, start);
         seek(fd, entry.start + offset);
+        version(multifilelog) infof("writing %s bytes to entry %s at offset %s", data.length, name, ftell(fd));
         fd.write(data);
         fd.fflush();
-        infof("wrote %s data bytes to file", data.length);
+        version(multifilelog) infof("wrote %s data bytes to file", data.length);
     }
 
     /**
@@ -195,7 +201,10 @@ struct Multifile
     }
 
 private:
+    string filename;
+    string fileZ;
     int filenumber;
+    FILE* fd;
     FILE* fd;
     Index index;
 
@@ -219,29 +228,48 @@ private:
             index.write();
             return entry;
         }
-        infof("entry %s exists already", name);
-        infof("length: %s vs %s", entry.length, minLength);
+        version(multifilelog) infof("entry %s exists already", name);
+        version(multifilelog) infof("length: %s vs %s", entry.length, minLength);
         if (entry.length >= minLength)
         {
             return entry;
         }
         if (index.resizeInPlace(entry, minLength))
         {
-            infof("resized in place");
+            version(multifilelog) infof("resized in place");
             return entry;
         }
-        infof("manually moving and resizing");
+        version(multifilelog) infof("manually moving and resizing");
         auto next = index.create("$$softie-tmp-resize", minLength);
-        auto src = fdopen(dup(fileno(fd)), "a+");
+        auto src = fopen(fileZ, "r+");
+        version(multifilelog) infof("read fd created");
         scope (exit) fclose(src);
+        version(multifilelog) infof("copying data from %s to %s", entry.start, next.start);
+        fseek(fd, 0, SEEK_END);
+        auto end = ftell(fd);
+        version(multifilelog) infof("last file position is %s", ftell(fd));
         seek(src, entry.start);
-        seek(fd, next.start);
+        if (end == next.start)
+        {
+            seekEnd(fd);
+        }
+        else
+        {
+            seek(fd, next.start);
+        }
         ubyte[1] buf;
         for (ulong i = 0; i < entry.length; i++)
         {
             src.read(buf);
             fd.write(buf);
         }
+        version(multifilelog) infof("done copying; zeroing out the rest");
+        buf[0] = 0;
+        for (ulong i = entry.length; i < minLength; i++)
+        {
+            fd.write(buf);
+        }
+        version(multifilelog) infof("zeroed out remainder; updating index");
         index.remove(entry);
         index.rename(next, name);
         flush();
@@ -305,7 +333,7 @@ struct Index
     void read()
     {
         auto len = fd.readUlong;
-        infof("index has %s entries", len);
+        version(multifilelog) infof("index has %s entries", len);
         for (int i = 0; i < len; i++)
         {
             insert(Entry.read(fd));
@@ -386,7 +414,7 @@ struct Index
     Entry create(string name, ulong length)
     {
         auto e = Entry(name, findGap(length), length);
-        infof("created new entry %s", e);
+        version(multifilelog) infof("created new entry %s", e);
         insert(e);
         return e;
     }
@@ -437,16 +465,16 @@ private:
     void writeHere()
     {
         auto start = ftell(fd);
-        infof("writing index to position %s", start);
+        version(multifilelog) infof("writing index to position %s", start);
         fd.writeUlong(byName.length);
-        infof("we have %s entries", byName.length);
+        version(multifilelog) infof("we have %s entries", byName.length);
         foreach (entry; byName)
         {
             entry.write(fd);
         }
         seek(fd, INDEX_POINTER_POSITION);
         fd.writeUlong(cast(ulong)start);
-        infof("wrote index pointer %s", cast(ulong)start);
+        version(multifilelog) infof("wrote index pointer %s", cast(ulong)start);
     }
 }
 
@@ -470,7 +498,7 @@ struct Entry
 
     ulong headerSize()
     {
-        return name.length + 4 * ulong.sizeof;
+        return name.length + 3 * ulong.sizeof;
     }
 
     void write(FILE* fd)
@@ -479,7 +507,6 @@ struct Entry
         fd.writeUlong(length);
         fd.writeUlong(name.length);
         fd.write(cast(const(ubyte[]))name);
-        fd.writeUlong(0);
     }
 
     static Entry read(FILE* fd)
@@ -488,11 +515,6 @@ struct Entry
         e.start = fd.readUlong;
         e.length = fd.readUlong;
         e.name = fd.readLenPrefixString;
-        auto barrier = fd.readUlong;
-        if (barrier != 0)
-        {
-            throw new Exception("Multifile index is corrupted");
-        }
         return e;
     }
 }
@@ -561,6 +583,17 @@ void seek(FILE* fd, ulong pos)
     }
 }
 
+void seekEnd(FILE* fd)
+{
+    auto res = fseek(fd, 0, SEEK_END);
+    if (res != 0)
+    {
+        auto err = errno;
+        auto errstr = strerror(err).fromStringz.idup;
+        throw new Exception("failed to seek to end of file file: %s".format(errstr));
+    }
+}
+
 
 unittest
 {
@@ -581,15 +614,34 @@ unittest
 
     ubyte[] data = [1, 1, 2, 3, 5, 8, 13, 21, 34, 55];
     multi.write("test-range-1", 0, data);
-    infof("wrote data");
+    version(multifilelog) infof("wrote data");
     auto read1 = multi.read("test-range-1");
     assert(read1 == data, "wanted %s got %s".format(data, read1));
     auto data2 = cast(const ubyte[])"A british tar is a soaring soul";
     multi.write("test-range-2", 0, data2);
-    infof("wrote data2");
+    version(multifilelog) infof("wrote data2");
     assert(multi.read("test-range-2") == data2);
     multi.flush;
     multi.close;
 
-    multi = Multifile(filename, true);
+    multi = Multifile(filename, false);
+    read1 = multi.read("test-range-1");
+    assert(read1 == data, "wanted %s got %s".format(data, read1));
+    assert(multi.read("test-range-2") == data2);
+    auto data2part2 = cast(const ubyte[]) " as free as a mountain bird";
+    multi.write("test-range-2", data2.length, data2part2);
+    multi.write("test-range-1", data.length - 2, [3, 1, 4, 1, 5, 9]);
+    multi.close;
+
+
+    multi = Multifile(filename, false);
+    assert(
+            (cast(string)multi.read("test-range-2").idup) ==
+            "A british tar is a soaring soul as free as a mountain bird");
+    ubyte[] expected = [
+        1, 1, 2, 3, 5, 8, 13, 21,
+        3, 1, 4, 1, 5, 9
+    ];
+    assert(multi.read("test-range-1") == expected);
+
 }

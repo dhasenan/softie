@@ -1,0 +1,8 @@
+{
+	"name": "softie",
+	"description": "A simple full text search index",
+	"copyright": "Copyright © 2017, dhasenan",
+	"authors": ["dhasenan"],
+	"dependencies": {
+	}
+}
