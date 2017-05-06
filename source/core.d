@@ -39,7 +39,8 @@ abstract class DocumentProcessor
 
     void process(string name, string text)
     {
-        documentId = writer.documentId(name);
+        auto documentId = writer.documentId(name);
+
     }
 
     /**

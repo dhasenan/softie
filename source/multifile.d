@@ -24,9 +24,8 @@ version(unittest) version = multifilelog;
   memory, which may not be appropriate for some use cases. The remainder of the file is only read as
   necessary.
 
-  A Multifile does not give you extra padding so that your files can grow in place. If you want
-  padding, please manage that on your own. In essence, Multifile is optimized more for compactness
-  than for quick appending.
+  A Multifile will by default try to give your allocations extra space on expansion to make repeated
+  appending more efficient.
 
   Entries in a Multifile prefixed with "$$" are reserved for internal use.
  */
@@ -42,11 +41,12 @@ struct Multifile
         file = The path to the file.
         createIfNecessary = Whether to create the file if necessary. Does not create directories.
     */
-    this(string file, bool createIfNecessary)
+    this(string file, bool createIfNecessary, double extraSpace = 0.8)
     {
         this.filename = file;
         this.fileZ = file.toStringz;
-        if (!exists(file))
+        this.extraSpace = 0.8;
+        if (!std.file.exists(file))
         {
             if (createIfNecessary)
             {
@@ -163,7 +163,10 @@ struct Multifile
         if (!entry.exists) return null;
         auto buf = new ubyte[entry.length];
         seek(fd, entry.start);
-        version(multifilelog) infof("reading %s bytes from entry %s at offset %s", buf.length, name, entry.start);
+        version(multifilelog)
+        {
+            infof("reading %s bytes from entry %s at offset %s", buf.length, name, entry.start);
+        }
         fd.read(buf);
         return buf;
     }
@@ -177,10 +180,22 @@ struct Multifile
         auto entry = fetchWithLength(name, offset + data.length);
         auto start = entry.start + offset;
         seek(fd, entry.start + offset);
-        version(multifilelog) infof("writing %s bytes to entry %s at offset %s", data.length, name, ftell(fd));
+        version(multifilelog)
+        {
+            infof("writing %s bytes to entry %s at offset %s", data.length, name, ftell(fd));
+        }
         fd.write(data);
         fd.fflush();
         version(multifilelog) infof("wrote %s data bytes to file", data.length);
+    }
+
+    /**
+        Append data to the file.
+      */
+    void append(string name, scope const ubyte[] data)
+    {
+        auto len = index.get(name).length;
+        write(name, len, data);
     }
 
     /**
@@ -193,6 +208,9 @@ struct Multifile
         fflush(fd);
     }
 
+    /**
+      Close this file, flushing it if necessary.
+     */
     void close()
     {
         flush();
@@ -200,13 +218,29 @@ struct Multifile
         fd = null;
     }
 
+    /**
+      Determine whether this contains a file with the given name.
+     */
+    bool exists(string name)
+    {
+        return index.get(name).exists;
+    }
+
+    /**
+      Get the length of the given file.
+     */
+    ulong length(string name)
+    {
+        return index.get(name).length;
+    }
+
 private:
     string filename;
-    string fileZ;
+    immutable(char)* fileZ;
     int filenumber;
     FILE* fd;
-    FILE* fd;
     Index index;
+    double extraSpace;
 
     void checkNotClosed()
     {
@@ -224,7 +258,7 @@ private:
         auto entry = index.get(name);
         if (!entry.exists)
         {
-            entry = index.create(name, minLength);
+            entry = index.create(name, minLength, extraSpace);
             index.write();
             return entry;
         }
@@ -240,7 +274,7 @@ private:
             return entry;
         }
         version(multifilelog) infof("manually moving and resizing");
-        auto next = index.create("$$softie-tmp-resize", minLength);
+        auto next = index.create("$$softie-tmp-resize", minLength, extraSpace);
         auto src = fopen(fileZ, "r+");
         version(multifilelog) infof("read fd created");
         scope (exit) fclose(src);
@@ -276,6 +310,8 @@ private:
         return next;
     }
 }
+
+private:
 
 /*
 
@@ -411,9 +447,9 @@ struct Index
         insert(entry);
     }
 
-    Entry create(string name, ulong length)
+    Entry create(string name, ulong length, double extraSpace)
     {
-        auto e = Entry(name, findGap(length), length);
+        auto e = Entry(name, findGap(cast(ulong)(length * (1 + extraSpace))), length);
         version(multifilelog) infof("created new entry %s", e);
         insert(e);
         return e;
